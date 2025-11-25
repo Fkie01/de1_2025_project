@@ -1,23 +1,50 @@
 import time
 import json
 import requests
-from kafka import KafkaProducer
+import psycopg2
 
-BOOTSTRAP_SERVERS = ["localhost:19092"]
-TOPIC_ISIGMET = "weather-isigmet"
-TOPIC_GAIRMET = "weather-gairmet"
-
+# ----------------------
+# Configuration
+# ----------------------
 HEADERS = {"User-Agent": "MyWeatherApp/1.0 (myemail@example.com)"}
+PG_HOST = "localhost"
+PG_PORT = 5432
+PG_DB = "aero_traffic"
+PG_USER = "admin"
+PG_PASSWORD = "password123"
 
-
-def create_producer():
-    return KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        retries=5,
-        request_timeout_ms=10000
+# ----------------------
+# PostgreSQL helpers
+# ----------------------
+def get_pg_connection():
+    conn = psycopg2.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=PG_DB,
+        user=PG_USER,
+        password=PG_PASSWORD
     )
+    conn.autocommit = True
+    return conn
 
+def create_weather_table(conn, table_name):
+    cur = conn.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            type TEXT,
+            geometry JSONB,
+            properties JSONB,
+            source TEXT,
+            ingested_at DOUBLE PRECISION
+        );
+    """)
+    cur.close()
+
+def insert_weather(cur, table_name, record):
+    cur.execute(f"""
+        INSERT INTO {table_name} (type, geometry, properties, source, ingested_at)
+        VALUES (%(type)s, %(geometry)s, %(properties)s, %(source)s, %(ingested_at)s)
+    """, record)
 
 # ----------------------
 # Fetchers
@@ -27,31 +54,24 @@ def fetch_isigmet():
     params = {"loc": "all", "hazard": "all", "format": "json"}
     r = requests.get(url, params=params, headers=HEADERS, timeout=10)
     r.raise_for_status()
-    return r.json()   # <-- RETURNS A LIST
-
+    return r.json()  # returns a list
 
 def fetch_gairmet():
     url = "https://aviationweather.gov/api/data/gairmet"
     params = {"type": "all", "format": "json"}
     r = requests.get(url, params=params, headers=HEADERS, timeout=10)
     r.raise_for_status()
-    return r.json()   # <-- RETURNS GeoJSON (dict with "features")
-    
+    return r.json()  # returns dict with 'features'
 
 # ----------------------
 # Normalizers
 # ----------------------
 def normalize_isigmet(isigmet_list):
-    """Convert ISIGMET list items into Kafka-friendly records."""
     normalized = []
-
     for item in isigmet_list:
         if not isinstance(item, dict):
-            continue  # skip if item is a list or unexpected
-
+            continue
         geometry = None
-
-        # 1. points: "lat,lon lat,lon ..."
         if "points" in item and isinstance(item["points"], str):
             coords = []
             try:
@@ -62,12 +82,10 @@ def normalize_isigmet(isigmet_list):
                     geometry = {"type": "Polygon", "coordinates": [coords]}
             except:
                 geometry = None
-
-        # 2. latlonpairs: "lat lon lat lon ..."
         elif "latlonpairs" in item and isinstance(item["latlonpairs"], str):
             coords = []
-            tokens = item["latlonpairs"].split()
             try:
+                tokens = item["latlonpairs"].split()
                 it = iter(tokens)
                 for lat, lon in zip(it, it):
                     coords.append([float(lat), float(lon)])
@@ -75,43 +93,30 @@ def normalize_isigmet(isigmet_list):
                     geometry = {"type": "Polygon", "coordinates": [coords]}
             except:
                 geometry = None
-
         normalized.append({
             "type": item.get("hazard", "UNKNOWN"),
-            "geometry": geometry,
-            "properties": item,
+            "geometry": json.dumps(geometry),
+            "properties": json.dumps(item),
             "source": "ISIGMET",
             "ingested_at": time.time()
         })
-
     return normalized
 
-
-
-
 def normalize_gairmet(gairmet_raw):
-    """
-    Convert GAIRMET response to a list of Kafka-friendly messages.
-    Handles both GeoJSON dict and plain list.
-    """
     normalized = []
-
     if isinstance(gairmet_raw, dict):
         features = gairmet_raw.get("features", [])
         for item in features:
             normalized.append({
                 "type": item.get("properties", {}).get("hazard", "UNKNOWN"),
-                "geometry": item.get("geometry"),
-                "properties": item.get("properties"),
+                "geometry": json.dumps(item.get("geometry")),
+                "properties": json.dumps(item.get("properties")),
                 "source": "GAIRMET",
                 "ingested_at": time.time()
             })
     elif isinstance(gairmet_raw, list):
         for item in gairmet_raw:
-            if not isinstance(item, dict):
-                continue
             geometry = None
-            # Handle latlonpairs or points for list-based GAIRMET
             if "points" in item and isinstance(item["points"], str):
                 coords = []
                 try:
@@ -133,66 +138,51 @@ def normalize_gairmet(gairmet_raw):
                         geometry = {"type": "Polygon", "coordinates": [coords]}
                 except:
                     geometry = None
-
             normalized.append({
                 "type": item.get("hazard", "UNKNOWN"),
-                "geometry": geometry,
-                "properties": item,
+                "geometry": json.dumps(geometry),
+                "properties": json.dumps(item),
                 "source": "GAIRMET",
                 "ingested_at": time.time()
             })
-    else:
-        print("⚠ GAIRMET response is neither dict nor list")
-
     return normalized
 
-
-
 # ----------------------
-# Producer Main Loop
+# Main Loop
 # ----------------------
 def main():
-    producer = create_producer()
+    conn = get_pg_connection()
+    cur = conn.cursor()
+    create_weather_table(conn, "isigmet")
+    create_weather_table(conn, "gairmet")
 
-    print("Weather producer running...")
-    print("Streaming ISIGMET + GAIRMET advisories every 1 minutes")
+    print("Weather ingestion into PostgreSQL running...")
+    print("Streaming ISIGMET + GAIRMET advisories every 1 minute")
 
-    while True:
-        try:
-            # ----------- ISIGMET -----------
+    try:
+        while True:
+            # ISIGMET
             isig_raw = fetch_isigmet()
             isig_list = normalize_isigmet(isig_raw)
-
             for record in isig_list:
-                record["ingested_at"] = time.time()
-                producer.send(TOPIC_ISIGMET, value=record)
+                insert_weather(cur, "isigmet", record)
+            print(f"✔ Inserted {len(isig_list)} ISIGMET advisories")
 
-            print(f"✔ Streamed {len(isig_list)} ISIGMET advisories")
-
-
-            # ----------- GAIRMET -----------
+            # GAIRMET
             g_raw = fetch_gairmet()
             g_list = normalize_gairmet(g_raw)
+            for record in g_list:
+                insert_weather(cur, "gairmet", record)
+            print(f"✔ Inserted {len(g_list)} GAIRMET advisories")
 
-            for item in g_list:
-                record = {
-                    "type": item["properties"].get("hazard", "UNKNOWN"),
-                    "geometry": item.get("geometry"),
-                    "properties": item.get("properties"),
-                    "source": "GAIRMET",
-                    "ingested_at": time.time()
-                }
-                producer.send(TOPIC_GAIRMET, value=record)
+            time.sleep(60)
 
-            print(f"✔ Streamed {len(g_list)} GAIRMET advisories")
+    except KeyboardInterrupt:
+        print("Stopping ingestion...")
 
-            producer.flush()
-
-        except Exception as e:
-            print("❌ Error:", e)
-
-        time.sleep(60)  # 5 minutes
-
+    finally:
+        cur.close()
+        conn.close()
 
 if __name__ == "__main__":
     main()
