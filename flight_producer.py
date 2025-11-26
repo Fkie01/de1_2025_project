@@ -10,7 +10,15 @@ import psycopg2
 TOPIC_NAME = 'sky-telemetry'  # not used here, just reference
 OPENSKY_URL = "https://opensky-network.org/api/states/all"
 
-BOUNDING_BOX = {'lamin': 45.83, 'lomin': 5.99, 'lamax': 47.80, 'lomax': 10.49}
+# Bounding Box (Lat/Lon) - Currently set to Switzerland/Central Europe to limit data volume
+# Format: [min_lat, min_lon, max_lat, max_lon]
+# You can comment this out to get GLOBAL data, but it will be heavy.
+BOUNDING_BOX = {
+    'lamin': 24.396308,
+    'lomin': -124.848974,
+    'lamax': 49.384358,
+    'lomax': -66.885444
+}
 
 # PostgreSQL connection
 PG_HOST = "localhost"
@@ -88,7 +96,6 @@ def main():
     cur = conn.cursor()
 
     print("Starting OpenSky ingestion into PostgreSQL...")
-    print("Press Ctrl+C to stop.")
 
     try:
         while True:
